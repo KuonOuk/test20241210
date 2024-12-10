@@ -1,72 +1,72 @@
 import boto3
+import logging
+from botocore.exceptions import ClientError
 
-def get_all_jobs():
+def get_all_glue_jobs():
     """
-    アカウント内の全てのジョブ名を取得
+    全てのAWS Glueジョブを取得
     """
-    glue_client = boto3.client('glue')
-    job_names = []
-    next_token = None
+    try:
+        jobs = []
+        glue_client = boto3.client('glue')
 
-    while True:
-        if next_token:
-            response = glue_client.list_jobs(NextToken=next_token)
-        else:
-            response = glue_client.list_jobs()
+        # 初回のジョブリスト取得
+        response = glue_client.get_jobs()
+        jobs.extend(response['Jobs'])
 
-        job_names.extend(response['JobNames'])
-        next_token = response.get('NextToken')
+        # ページネーションの処理
+        while 'NextToken' in response:
+            response = glue_client.get_jobs(NextToken=response['NextToken'])
+            jobs.extend(response['Jobs'])
 
-        if not next_token:
-            break
+        return jobs
 
-    return job_names
+    except ClientError as err:
+        logging.error("ジョブを取得できませんでした。原因: %s: %s", err.response["Error"]["Code"], err.response["Error"]["Message"])
+    except Exception as err:
+        logging.error("ジョブの取得処理中にエラーが発生しました: %s", err)
+    return []
 
 
-def get_all_jobs_and_runs():
+def get_all_job_runs(job_name):
     """
-    全てのジョブの全履歴を取得
+    指定されたAWS Glueジョブの全履歴を取得
     """
-    glue_client = boto3.client('glue')
-    all_job_runs = {}
-    job_names = get_all_jobs()
+    try:
+        job_runs = []
+        glue_client = boto3.client('glue')
 
-    for job_name in job_names:
-        all_job_runs[job_name] = []
-        next_token = None
-        while True:
-            if next_token:
-                response = glue_client.get_job_runs(JobName=job_name, MaxResults=100, NextToken=next_token)
-            else:
-                response = glue_client.get_job_runs(JobName=job_name, MaxResults=100)
+        # 初回のジョブ履歴取得
+        response = glue_client.get_job_runs(JobName=job_name)
+        job_runs.extend(response['JobRuns'])
 
-            for job_run in response['JobRuns']:
-                if 'StartedOn' in job_run and 'CompletedOn' in job_run:
-                    all_job_runs[job_name].append({
-                        'start': job_run['StartedOn'],
-                        'end': job_run['CompletedOn']
-                    })
+        # ページネーションの処理
+        while 'NextToken' in response:
+            response = glue_client.get_job_runs(JobName=job_name, NextToken=response['NextToken'])
+            job_runs.extend(response['JobRuns'])
 
-            next_token = response.get('NextToken')
-            if not next_token:
-                break
+        return job_runs
 
-    return all_job_runs
+    except ClientError as err:
+        logging.error("ジョブ履歴を取得できませんでした。原因: %s: %s", err.response["Error"]["Code"], err.response["Error"]["Message"])
+    except Exception as err:
+        logging.error("ジョブ履歴の取得処理中にエラーが発生しました: %s", err)
+    return []
 
 
 def calculate_max_concurrent_jobs(job_runs):
     """
     同時実行ジョブ数の最大値を計算
     """
-    job_runs.sort(key=lambda x: x['start'])
+    job_runs.sort(key=lambda x: x['StartedOn'])
 
     max_concurrent_jobs = 0
     current_jobs = 0
     events = []
 
     for run in job_runs:
-        events.append((run['start'], 1))  # 開始イベント
-        events.append((run['end'], -1))  # 終了イベント
+        events.append((run['StartedOn'], 1))  # 開始イベント
+        events.append((run['CompletedOn'], -1))  # 終了イベント
 
     events.sort(key=lambda x: x[0])
 
@@ -81,12 +81,19 @@ def get_account_max_concurrent_jobs_and_details():
     """
     アカウント全体で同時実行されたジョブの最大数とその詳細を取得
     """
-    all_job_runs = get_all_jobs_and_runs()
+    all_jobs = get_all_glue_jobs()
     combined_job_runs = []
 
-    for job_name, runs in all_job_runs.items():
-        for run in runs:
-            combined_job_runs.append({'start': run['start'], 'end': run['end'], 'job_name': job_name})
+    for job in all_jobs:
+        job_name = job['Name']  # 必要に応じてキーを変更
+        job_runs = get_all_job_runs(job_name)
+        for run in job_runs:
+            if 'StartedOn' in run and 'CompletedOn' in run:
+                combined_job_runs.append({
+                    'start': run['StartedOn'],
+                    'end': run['CompletedOn'],
+                    'job_name': job_name
+                })
 
     # 同時実行ジョブ数の計算
     combined_job_runs.sort(key=lambda x: x['start'])
@@ -113,42 +120,10 @@ def get_account_max_concurrent_jobs_and_details():
     return max_concurrent_jobs, max_concurrent_job_names
 
 
-def get_job_with_highest_concurrent_runs():
-    """
-    全てのジョブの中で、同時実行ジョブの最大数が最も多いジョブを取得
-    """
-    all_job_runs = get_all_jobs_and_runs()
-    max_concurrent_jobs = 0
-    max_concurrent_job_name = None
-
-    for job_name, job_runs in all_job_runs.items():
-        concurrent_jobs = calculate_max_concurrent_jobs(job_runs)
-        if concurrent_jobs > max_concurrent_jobs:
-            max_concurrent_jobs = concurrent_jobs
-            max_concurrent_job_name = job_name
-
-    return max_concurrent_job_name, max_concurrent_jobs
-
-
-def get_total_job_count():
-    """
-    アカウント全体で登録されているジョブの総数を取得
-    """
-    job_names = get_all_jobs()
-    return len(job_names)
-
-
 if __name__ == "__main__":
-    # アカウント全体の同時実行ジョブの最大数とそのジョブ名リスト
-    account_max_concurrent_jobs, max_concurrent_job_names = get_account_max_concurrent_jobs_and_details()
-    print(f"アカウント全体で同時に実行されたジョブの最大数: {account_max_concurrent_jobs}")
+    logging.basicConfig(level=logging.INFO)
+
+    # アカウント全体の同時実行ジョブの最大数と詳細
+    max_concurrent_jobs, max_concurrent_job_names = get_account_max_concurrent_jobs_and_details()
+    print(f"アカウント全体で同時に実行されたジョブの最大数: {max_concurrent_jobs}")
     print(f"その時実行されていたジョブ: {max_concurrent_job_names}")
-
-    # 全てのジョブの中で、同時実行ジョブ数が最大のジョブ
-    job_with_highest_concurrent, highest_concurrent_runs = get_job_with_highest_concurrent_runs()
-    print(f"最も同時実行ジョブ数が多いジョブ: {job_with_highest_concurrent}")
-    print(f"そのジョブの同時実行ジョブの最大数: {highest_concurrent_runs}")
-
-    # アカウント全体のジョブ数
-    total_job_count = get_total_job_count()
-    print(f"アカウント全体で登録されているジョブの総数: {total_job_count}")
