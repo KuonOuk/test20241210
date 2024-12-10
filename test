@@ -2,6 +2,8 @@ import boto3
 import logging
 from botocore.exceptions import ClientError
 
+# AWS Glue クライアントの初期化
+glue = boto3.client('glue')
 
 def get_all_glue_jobs():
     """
@@ -9,15 +11,14 @@ def get_all_glue_jobs():
     """
     try:
         jobs = []
-        glue_client = boto3.client('glue')
 
         # 初回のジョブリスト取得
-        response = glue_client.get_jobs()
+        response = glue.get_jobs()
         jobs.extend(response['Jobs'])
 
         # ページネーションの処理
         while 'NextToken' in response:
-            response = glue_client.get_jobs(NextToken=response['NextToken'])
+            response = glue.get_jobs(NextToken=response['NextToken'])
             jobs.extend(response['Jobs'])
 
         return jobs
@@ -35,16 +36,15 @@ def get_all_job_runs(job_name):
     """
     try:
         job_runs = []
-        glue_client = boto3.client('glue')
 
         # 初回のジョブ履歴取得
-        response = glue_client.get_job_runs(JobName=job_name)
-        job_runs.extend(response['JobRuns'])
+        response = glue.get_job_runs(JobName=job_name)
+        job_runs.extend([run for run in response['JobRuns'] if 'StartedOn' in run and 'CompletedOn' in run])
 
         # ページネーションの処理
         while 'NextToken' in response:
-            response = glue_client.get_job_runs(JobName=job_name, NextToken=response['NextToken'])
-            job_runs.extend(response['JobRuns'])
+            response = glue.get_job_runs(JobName=job_name, NextToken=response['NextToken'])
+            job_runs.extend([run for run in response['JobRuns'] if 'StartedOn' in run and 'CompletedOn' in run])
 
         return job_runs
 
@@ -59,7 +59,8 @@ def calculate_max_concurrent_jobs(job_runs):
     """
     同時実行ジョブ数の最大値を計算
     """
-    job_runs.sort(key=lambda x: x['StartedOn'])
+    # 仮引数を glue に変更
+    job_runs.sort(key=lambda glue: glue['StartedOn'])
 
     max_concurrent_jobs = 0
     current_jobs = 0
@@ -69,7 +70,7 @@ def calculate_max_concurrent_jobs(job_runs):
         events.append((run['StartedOn'], 1))  # 開始イベント
         events.append((run['CompletedOn'], -1))  # 終了イベント
 
-    events.sort(key=lambda x: x[0])
+    events.sort(key=lambda glue: glue[0])  # 仮引数を glue に変更
 
     for event in events:
         current_jobs += event[1]
@@ -78,27 +79,51 @@ def calculate_max_concurrent_jobs(job_runs):
     return max_concurrent_jobs
 
 
-def get_account_max_concurrent_jobs():
+def get_account_max_concurrent_jobs_and_details():
     """
-    アカウント全体で同時実行されたジョブの最大数を取得
+    アカウント全体で同時実行されたジョブの最大数とその詳細を取得
     """
     all_jobs = get_all_glue_jobs()
     combined_job_runs = []
 
     for job in all_jobs:
-        job_name = job['Name']  # 必要に応じてキーを変更
+        job_name = job['Name']
         job_runs = get_all_job_runs(job_name)
         for run in job_runs:
-            if 'StartedOn' in run and 'CompletedOn' in run:
-                combined_job_runs.append({'start': run['StartedOn'], 'end': run['CompletedOn']})
+            combined_job_runs.append({
+                'start': run['StartedOn'],
+                'end': run['CompletedOn'],
+                'job_name': job_name
+            })
 
-    # 全ジョブの履歴をまとめて最大同時実行数を計算
-    return calculate_max_concurrent_jobs(combined_job_runs)
+    # 同時実行ジョブ数の計算
+    combined_job_runs.sort(key=lambda glue: glue['start'])  # 仮引数を glue に変更
+    max_concurrent_jobs = 0
+    current_jobs = []
+    events = []
+
+    for run in combined_job_runs:
+        events.append((run['start'], 1, run['job_name']))  # 開始イベント
+        events.append((run['end'], -1, run['job_name']))  # 終了イベント
+
+    events.sort(key=lambda glue: glue[0])  # 仮引数を glue に変更
+
+    for event in events:
+        if event[1] == 1:  # 開始イベント
+            current_jobs.append(event[2])
+        else:  # 終了イベント
+            current_jobs.remove(event[2])
+
+        if len(current_jobs) > max_concurrent_jobs:
+            max_concurrent_jobs = len(current_jobs)
+            max_concurrent_job_names = current_jobs.copy()
+
+    return max_concurrent_jobs, max_concurrent_job_names
 
 
-def get_all_jobs_max_concurrent_jobs():
+def get_job_with_highest_concurrent_runs():
     """
-    全てのジョブにおける同時実行ジョブの最大数を取得
+    各ジョブの同時実行ジョブの最大数を計算し、その中で最大値を持つジョブを取得
     """
     all_jobs = get_all_glue_jobs()
     max_concurrent_jobs = 0
@@ -108,9 +133,8 @@ def get_all_jobs_max_concurrent_jobs():
         job_name = job['Name']
         job_runs = get_all_job_runs(job_name)
         if not job_runs:
-            continue
+            continue  # 履歴がないジョブはスキップ
 
-        # 各ジョブの同時実行数を計算
         concurrent_jobs = calculate_max_concurrent_jobs(job_runs)
         if concurrent_jobs > max_concurrent_jobs:
             max_concurrent_jobs = concurrent_jobs
@@ -122,11 +146,12 @@ def get_all_jobs_max_concurrent_jobs():
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    # アカウント全体の同時実行ジョブの最大数
-    max_concurrent_jobs = get_account_max_concurrent_jobs()
-    print(f"アカウント全体で同時実行ジョブの最大数: {max_concurrent_jobs}")
+    # アカウント全体の同時実行ジョブの最大数と詳細
+    max_concurrent_jobs, max_concurrent_job_names = get_account_max_concurrent_jobs_and_details()
+    print(f"アカウント全体で同時に実行されたジョブの最大数: {max_concurrent_jobs}")
+    print(f"その時実行されていたジョブ: {max_concurrent_job_names}")
 
-    # 全ジョブの中で同時実行ジョブの最大数を持つジョブ
-    job_with_max_concurrent_runs, max_job_concurrent_runs = get_all_jobs_max_concurrent_jobs()
+    # ジョブの中で同時実行ジョブの最大数を持つジョブ
+    job_with_max_concurrent_runs, max_job_concurrent_runs = get_job_with_highest_concurrent_runs()
     print(f"最も同時実行ジョブ数が多いジョブ: {job_with_max_concurrent_runs}")
     print(f"そのジョブの同時実行ジョブの最大数: {max_job_concurrent_runs}")
