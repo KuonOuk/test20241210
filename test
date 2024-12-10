@@ -1,0 +1,63 @@
+import boto3
+from datetime import datetime, timedelta
+
+# クライアント作成
+cloudwatch = boto3.client('cloudwatch')
+glue = boto3.client('glue')
+service_quotas = boto3.client('service-quotas')
+
+# CloudWatchからメトリクスを取得
+def get_cloudwatch_metric(namespace, metric_name, dimensions):
+    response = cloudwatch.get_metric_data(
+        MetricDataQueries=[
+            {
+                'Id': 'metric1',
+                'MetricStat': {
+                    'Metric': {
+                        'Namespace': namespace,
+                        'MetricName': metric_name,
+                        'Dimensions': dimensions
+                    },
+                    'Period': 3600,  # 1時間ごと
+                    'Stat': 'Average'
+                },
+                'ReturnData': True,
+            },
+        ],
+        StartTime=datetime.utcnow() - timedelta(days=7),  # 過去7日間
+        EndTime=datetime.utcnow(),
+    )
+    if response['MetricDataResults']:
+        return response['MetricDataResults'][0]['Values']
+    return []
+
+# Glueの同時実行ジョブ最大数を取得（Service Quotas API）
+def get_glue_max_concurrent_runs():
+    response = service_quotas.get_service_quota(
+        ServiceCode='glue', 
+        QuotaCode='L-0EA2A6DC'  # Glueの同時実行ジョブ最大数
+    )
+    return response['Quota']['Value']
+
+# Glueのジョブ数を取得（Glue API）
+def get_glue_job_count():
+    response = glue.list_jobs()
+    return len(response['JobNames'])
+
+# メトリクス取得例
+if __name__ == "__main__":
+    # Glue: 同時実行ジョブの最大数（クォータ値）
+    max_concurrent_runs = get_glue_max_concurrent_runs()
+    print(f"Glue同時実行ジョブ最大数: {max_concurrent_runs}")
+
+    # Glue: 実際の同時実行ジョブ数（過去7日間）
+    concurrent_runs = get_cloudwatch_metric(
+        namespace='AWS/Glue',
+        metric_name='ConcurrentRuns',
+        dimensions=[]
+    )
+    print(f"Glue同時実行ジョブ数（過去7日間）: {concurrent_runs}")
+
+    # Glue: アカウント内のジョブ総数
+    total_jobs = get_glue_job_count()
+    print(f"Glueジョブ数（アカウント内の総数）: {total_jobs}")
