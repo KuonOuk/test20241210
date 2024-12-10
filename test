@@ -1,63 +1,154 @@
 import boto3
-from datetime import datetime, timedelta
 
-# クライアント作成
-cloudwatch = boto3.client('cloudwatch')
-glue = boto3.client('glue')
-service_quotas = boto3.client('service-quotas')
+def get_all_jobs():
+    """
+    アカウント内の全てのジョブ名を取得
+    """
+    glue_client = boto3.client('glue')
+    job_names = []
+    next_token = None
 
-# CloudWatchからメトリクスを取得
-def get_cloudwatch_metric(namespace, metric_name, dimensions):
-    response = cloudwatch.get_metric_data(
-        MetricDataQueries=[
-            {
-                'Id': 'metric1',
-                'MetricStat': {
-                    'Metric': {
-                        'Namespace': namespace,
-                        'MetricName': metric_name,
-                        'Dimensions': dimensions
-                    },
-                    'Period': 3600,  # 1時間ごと
-                    'Stat': 'Average'
-                },
-                'ReturnData': True,
-            },
-        ],
-        StartTime=datetime.utcnow() - timedelta(days=7),  # 過去7日間
-        EndTime=datetime.utcnow(),
-    )
-    if response['MetricDataResults']:
-        return response['MetricDataResults'][0]['Values']
-    return []
+    while True:
+        if next_token:
+            response = glue_client.list_jobs(NextToken=next_token)
+        else:
+            response = glue_client.list_jobs()
 
-# Glueの同時実行ジョブ最大数を取得（Service Quotas API）
-def get_glue_max_concurrent_runs():
-    response = service_quotas.get_service_quota(
-        ServiceCode='glue', 
-        QuotaCode='L-0EA2A6DC'  # Glueの同時実行ジョブ最大数
-    )
-    return response['Quota']['Value']
+        job_names.extend(response['JobNames'])
+        next_token = response.get('NextToken')
 
-# Glueのジョブ数を取得（Glue API）
-def get_glue_job_count():
-    response = glue.list_jobs()
-    return len(response['JobNames'])
+        if not next_token:
+            break
 
-# メトリクス取得例
+    return job_names
+
+
+def get_all_jobs_and_runs():
+    """
+    全てのジョブの全履歴を取得
+    """
+    glue_client = boto3.client('glue')
+    all_job_runs = {}
+    job_names = get_all_jobs()
+
+    for job_name in job_names:
+        all_job_runs[job_name] = []
+        next_token = None
+        while True:
+            if next_token:
+                response = glue_client.get_job_runs(JobName=job_name, MaxResults=100, NextToken=next_token)
+            else:
+                response = glue_client.get_job_runs(JobName=job_name, MaxResults=100)
+
+            for job_run in response['JobRuns']:
+                if 'StartedOn' in job_run and 'CompletedOn' in job_run:
+                    all_job_runs[job_name].append({
+                        'start': job_run['StartedOn'],
+                        'end': job_run['CompletedOn']
+                    })
+
+            next_token = response.get('NextToken')
+            if not next_token:
+                break
+
+    return all_job_runs
+
+
+def calculate_max_concurrent_jobs(job_runs):
+    """
+    同時実行ジョブ数の最大値を計算
+    """
+    job_runs.sort(key=lambda x: x['start'])
+
+    max_concurrent_jobs = 0
+    current_jobs = 0
+    events = []
+
+    for run in job_runs:
+        events.append((run['start'], 1))  # 開始イベント
+        events.append((run['end'], -1))  # 終了イベント
+
+    events.sort(key=lambda x: x[0])
+
+    for event in events:
+        current_jobs += event[1]
+        max_concurrent_jobs = max(max_concurrent_jobs, current_jobs)
+
+    return max_concurrent_jobs
+
+
+def get_account_max_concurrent_jobs_and_details():
+    """
+    アカウント全体で同時実行されたジョブの最大数とその詳細を取得
+    """
+    all_job_runs = get_all_jobs_and_runs()
+    combined_job_runs = []
+
+    for job_name, runs in all_job_runs.items():
+        for run in runs:
+            combined_job_runs.append({'start': run['start'], 'end': run['end'], 'job_name': job_name})
+
+    # 同時実行ジョブ数の計算
+    combined_job_runs.sort(key=lambda x: x['start'])
+    max_concurrent_jobs = 0
+    current_jobs = []
+    events = []
+
+    for run in combined_job_runs:
+        events.append((run['start'], 1, run['job_name']))  # 開始イベント
+        events.append((run['end'], -1, run['job_name']))  # 終了イベント
+
+    events.sort(key=lambda x: x[0])
+
+    for event in events:
+        if event[1] == 1:  # 開始イベント
+            current_jobs.append(event[2])
+        else:  # 終了イベント
+            current_jobs.remove(event[2])
+
+        if len(current_jobs) > max_concurrent_jobs:
+            max_concurrent_jobs = len(current_jobs)
+            max_concurrent_job_names = current_jobs.copy()
+
+    return max_concurrent_jobs, max_concurrent_job_names
+
+
+def get_job_with_highest_concurrent_runs():
+    """
+    全てのジョブの中で、同時実行ジョブの最大数が最も多いジョブを取得
+    """
+    all_job_runs = get_all_jobs_and_runs()
+    max_concurrent_jobs = 0
+    max_concurrent_job_name = None
+
+    for job_name, job_runs in all_job_runs.items():
+        concurrent_jobs = calculate_max_concurrent_jobs(job_runs)
+        if concurrent_jobs > max_concurrent_jobs:
+            max_concurrent_jobs = concurrent_jobs
+            max_concurrent_job_name = job_name
+
+    return max_concurrent_job_name, max_concurrent_jobs
+
+
+def get_total_job_count():
+    """
+    アカウント全体で登録されているジョブの総数を取得
+    """
+    job_names = get_all_jobs()
+    return len(job_names)
+
+
 if __name__ == "__main__":
-    # Glue: 同時実行ジョブの最大数（クォータ値）
-    max_concurrent_runs = get_glue_max_concurrent_runs()
-    print(f"Glue同時実行ジョブ最大数: {max_concurrent_runs}")
+    # アカウント全体の同時実行ジョブの最大数とそのジョブ名リスト
+    account_max_concurrent_jobs, max_concurrent_job_names = get_account_max_concurrent_jobs_and_details()
+    print(f"アカウント全体で同時に実行されたジョブの最大数: {account_max_concurrent_jobs}")
+    print(f"その時実行されていたジョブ: {max_concurrent_job_names}")
 
-    # Glue: 実際の同時実行ジョブ数（過去7日間）
-    concurrent_runs = get_cloudwatch_metric(
-        namespace='AWS/Glue',
-        metric_name='ConcurrentRuns',
-        dimensions=[]
-    )
-    print(f"Glue同時実行ジョブ数（過去7日間）: {concurrent_runs}")
+    # 全てのジョブの中で、同時実行ジョブ数が最大のジョブ
+    job_with_highest_concurrent, highest_concurrent_runs = get_job_with_highest_concurrent_runs()
+    print(f"最も同時実行ジョブ数が多いジョブ: {job_with_highest_concurrent}")
+    print(f"そのジョブの同時実行ジョブの最大数: {highest_concurrent_runs}")
 
-    # Glue: アカウント内のジョブ総数
-    total_jobs = get_glue_job_count()
-    print(f"Glueジョブ数（アカウント内の総数）: {total_jobs}")
+    # アカウント全体のジョブ数
+    total_job_count = get_total_job_count()
+    print(f"アカウント全体で登録されているジョブの総数: {total_job_count}")
