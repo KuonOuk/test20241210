@@ -151,3 +151,174 @@ if __name__ == "__main__":
 
     # ジョブごとの同時実行ジョブ数をCSVに保存し、最大値を出力
     save_job_concurrent_counts_to_csv()
+
+
+
+----------12/12-----------
+
+import json
+import boto3
+
+def lambda_handler(event, context):
+    ddl_count = 0
+    dml_count = 0
+    max_ddl_time = 0
+    max_dml_time = 0
+
+    for record in event['Records']:
+        query = record['query']
+        execution_time = record.get('executionTime', 0)
+        
+        # クエリを分類
+        if query.upper().startswith(('CREATE', 'ALTER', 'DROP')):
+            ddl_count += 1
+            max_ddl_time = max(max_ddl_time, execution_time)
+        elif query.upper().startswith(('SELECT', 'INSERT', 'UPDATE', 'DELETE')):
+            dml_count += 1
+            max_dml_time = max(max_dml_time, execution_time)
+
+    # CloudWatchメトリクスに送信
+    cloudwatch = boto3.client('cloudwatch')
+    cloudwatch.put_metric_data(
+        Namespace='AthenaMetrics',
+        MetricData=[
+            {'MetricName': 'ActiveDDLQueries', 'Value': ddl_count},
+            {'MetricName': 'ActiveDMLQueries', 'Value': dml_count},
+            {'MetricName': 'MaxDDLExecutionTime', 'Value': max_ddl_time},
+            {'MetricName': 'MaxDMLExecutionTime', 'Value': max_dml_time},
+        ]
+    )
+    return {'status': 'success'}
+
+
+----------12/12-------- python
+
+import boto3
+
+def get_athena_query_details():
+    client = boto3.client('athena', region_name='your-region')
+    query_ids = client.list_query_executions()['QueryExecutionIds']
+
+    active_ddl = 0
+    active_dml = 0
+    max_ddl_time = 0
+    max_dml_time = 0
+
+    for query_id in query_ids:
+        query_execution = client.get_query_execution(QueryExecutionId=query_id)
+        query = query_execution['QueryExecution']['Query']
+        state = query_execution['QueryExecution']['Status']['State']
+        execution_time = query_execution['QueryExecution']['Statistics'].get('EngineExecutionTimeInMillis', 0)
+
+        # クエリを解析して分類
+        if query.strip().upper().startswith(('CREATE', 'ALTER', 'DROP')):
+            if state == 'RUNNING':
+                active_ddl += 1
+            max_ddl_time = max(max_ddl_time, execution_time)
+        elif query.strip().upper().startswith(('SELECT', 'INSERT', 'UPDATE', 'DELETE')):
+            if state == 'RUNNING':
+                active_dml += 1
+            max_dml_time = max(max_dml_time, execution_time)
+
+    return {
+        "active_ddl": active_ddl,
+        "active_dml": active_dml,
+        "max_ddl_time_ms": max_ddl_time,
+        "max_dml_time_ms": max_dml_time,
+    }
+
+
+if __name__ == "__main__":
+    result = get_athena_query_details()
+    print("アクティブなDDLクエリ数:", result["active_ddl"])
+    print("アクティブなDMLクエリ数:", result["active_dml"])
+    print("DDLクエリの最大実行時間 (ms):", result["max_ddl_time_ms"])
+    print("DMLクエリの最大実行時間 (ms):", result["max_dml_time_ms"])
+
+
+------------------python---------------
+import boto3
+import time
+import json
+
+def query_cloudwatch_logs(log_group_name, query_string, start_time, end_time):
+    """
+    CloudWatch Logs Insightsクエリを実行し、結果を取得する。
+    """
+    client = boto3.client('logs', region_name='your-region')  # リージョンを指定
+    # クエリを開始
+    response = client.start_query(
+        logGroupName=log_group_name,
+        startTime=start_time,
+        endTime=end_time,
+        queryString=query_string
+    )
+
+    query_id = response['queryId']
+    print(f"Query started: {query_id}")
+
+    # クエリの結果が出るまで待機
+    while True:
+        result = client.get_query_results(queryId=query_id)
+        if result['status'] == 'Complete':
+            return result['results']
+        time.sleep(1)
+
+
+def main():
+    # CloudWatch Logsの設定
+    log_group_name = "/aws/athena/query"  # Athenaのクエリログが記録されているロググループ名
+
+    # 開始時間と終了時間を設定（過去1日分のデータを取得する例）
+    end_time = int(time.time())
+    start_time = end_time - 24 * 60 * 60  # 24時間前
+
+    # DDLクエリのアクティブ数と最大実行時間を取得
+    query_ddl_active = """
+    fields @timestamp, query, state
+    | filter state = "RUNNING"
+    | parse query /^([A-Z]+)\s+/ as queryType
+    | filter queryType in ["CREATE", "ALTER", "DROP"]
+    | stats count() as activeDDLQueries
+    """
+    ddl_active_results = query_cloudwatch_logs(log_group_name, query_ddl_active, start_time, end_time)
+    print("アクティブなDDLクエリ数:")
+    print(json.dumps(ddl_active_results, indent=2))
+
+    query_ddl_max_time = """
+    fields @timestamp, query, state, executionTime
+    | filter state = "SUCCEEDED"
+    | parse query /^([A-Z]+)\s+/ as queryType
+    | filter queryType in ["CREATE", "ALTER", "DROP"]
+    | stats max(executionTime) as maxDDLExecutionTime
+    """
+    ddl_max_time_results = query_cloudwatch_logs(log_group_name, query_ddl_max_time, start_time, end_time)
+    print("DDLクエリの最大実行時間:")
+    print(json.dumps(ddl_max_time_results, indent=2))
+
+    # DMLクエリのアクティブ数と最大実行時間を取得
+    query_dml_active = """
+    fields @timestamp, query, state
+    | filter state = "RUNNING"
+    | parse query /^([A-Z]+)\s+/ as queryType
+    | filter queryType in ["SELECT", "INSERT", "UPDATE", "DELETE"]
+    | stats count() as activeDMLQueries
+    """
+    dml_active_results = query_cloudwatch_logs(log_group_name, query_dml_active, start_time, end_time)
+    print("アクティブなDMLクエリ数:")
+    print(json.dumps(dml_active_results, indent=2))
+
+    query_dml_max_time = """
+    fields @timestamp, query, state, executionTime
+    | filter state = "SUCCEEDED"
+    | parse query /^([A-Z]+)\s+/ as queryType
+    | filter queryType in ["SELECT", "INSERT", "UPDATE", "DELETE"]
+    | stats max(executionTime) as maxDMLExecutionTime
+    """
+    dml_max_time_results = query_cloudwatch_logs(log_group_name, query_dml_max_time, start_time, end_time)
+    print("DMLクエリの最大実行時間:")
+    print(json.dumps(dml_max_time_results, indent=2))
+
+
+if __name__ == "__main__":
+    main()
