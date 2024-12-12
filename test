@@ -1,243 +1,4 @@
 import boto3
-import logging
-import csv
-from botocore.exceptions import ClientError
-
-# AWS Glue クライアントの初期化
-glue = boto3.client('glue')
-
-def get_all_glue_jobs():
-    """全てのAWS Glueジョブを取得"""
-    try:
-        jobs = []
-        response = glue.get_jobs()
-        jobs.extend(response['Jobs'])
-
-        # ページネーションの処理
-        while 'NextToken' in response:
-            response = glue.get_jobs(NextToken=response['NextToken'])
-            jobs.extend(response['Jobs'])
-        return jobs
-
-    except ClientError as err:
-        logging.error("ジョブを取得できませんでした。原因: %s: %s", err.response["Error"]["Code"], err.response["Error"]["Message"])
-    except Exception as err:
-        logging.error("ジョブの取得処理中にエラーが発生しました: %s", err)
-    return []
-
-
-def get_all_job_runs(job_name):
-    """全てのAWS Glueジョブの全履歴を取得"""
-    try:
-        job_runs = []
-        response = glue.get_job_runs(JobName=job_name)
-        job_runs.extend([run for run in response['JobRuns'] if 'StartedOn' in run and 'CompletedOn' in run])
-
-        # ページネーションの処理
-        while 'NextToken' in response:
-            response = glue.get_job_runs(JobName=job_name, NextToken=response['NextToken'])
-            job_runs.extend([run for run in response['JobRuns'] if 'StartedOn' in run and 'CompletedOn' in run])
-        return job_runs
-
-    except ClientError as err:
-        logging.error("ジョブ履歴を取得できませんでした。原因: %s: %s", err.response["Error"]["Code"], err.response["Error"]["Message"])
-    except Exception as err:
-        logging.error("ジョブ履歴の取得処理中にエラーが発生しました: %s", err)
-    return []
-
-
-def calculate_concurrent_jobs(job_runs, job_name=None):
-    """
-    同時実行ジョブ数の最大値を計算し、詳細を取得
-    Args:
-        job_runs: ジョブの実行履歴
-        job_name: 指定したジョブ名（Noneの場合は全ジョブ）
-    Returns:
-        最大同時実行ジョブ数, 最大同時実行ジョブのリスト
-    """
-    events = []
-    for run in job_runs:
-        events.append((run['StartedOn'], 1, job_name or run.get('job_name')))
-        events.append((run['CompletedOn'], -1, job_name or run.get('job_name')))
-
-    # イベントを時系列でソート
-    events.sort(key=lambda event: event[0])
-
-    max_concurrent_jobs = 0
-    current_jobs = []
-    max_job_names = []
-
-    # 同時実行ジョブ数を計算
-    for event in events:
-        if event[1] == 1:  # 開始イベント
-            current_jobs.append(event[2])
-        else:  # 終了イベント
-            current_jobs.remove(event[2])
-
-        if len(current_jobs) > max_concurrent_jobs:
-            max_concurrent_jobs = len(current_jobs)
-            max_job_names = current_jobs.copy()
-
-    return max_concurrent_jobs, max_job_names
-
-
-def get_account_concurrent_jobs():
-    """アカウント全体の同時実行ジョブ数を取得"""
-    all_jobs = get_all_glue_jobs()
-    combined_job_runs = []
-
-    for job in all_jobs:
-        job_name = job['Name']
-        job_runs = get_all_job_runs(job_name)
-        for run in job_runs:
-            combined_job_runs.append({'StartedOn': run['StartedOn'], 'CompletedOn': run['CompletedOn'], 'job_name': job_name})
-
-    return calculate_concurrent_jobs(combined_job_runs)
-
-
-def save_job_concurrent_counts_to_csv():
-    """
-    ジョブ名と同時実行ジョブ数をCSVファイルに保存し、ジョブの最大値をコンソールに出力
-    """
-    file_name = "glue_job_concurrent_counts.csv"
-    all_jobs = get_all_glue_jobs()
-    job_concurrent_counts = []
-    highest_concurrent_job_name = None
-    highest_concurrent_count = 0
-
-    for job in all_jobs:
-        job_name = job['Name']
-        job_runs = get_all_job_runs(job_name)
-
-        if not job_runs:
-            max_concurrent_jobs = 0
-        else:
-            max_concurrent_jobs, _ = calculate_concurrent_jobs(job_runs, job_name)
-
-        # 最大値のジョブを追跡
-        if max_concurrent_jobs > highest_concurrent_count:
-            highest_concurrent_count = max_concurrent_jobs
-            highest_concurrent_job_name = job_name
-
-        job_concurrent_counts.append({'JobName': job_name, 'MaxConcurrentJobs': max_concurrent_jobs})
-
-    # CSVファイルに保存
-    try:
-        with open(file_name, mode='w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            writer.writerow(["ジョブ名", "ジョブの同時実行ジョブの最大数"])  # ヘッダー
-            for job in job_concurrent_counts:
-                writer.writerow([job['JobName'], job['MaxConcurrentJobs']])
-
-        print(f"ジョブ名と同時実行ジョブ数が {file_name} に保存されました。")
-    except Exception as err:
-        logging.error("CSVファイルの保存中にエラーが発生しました: %s", err)
-
-    # 最大値のジョブを出力
-    print(f"ジョブの最大同時実行ジョブ数: {highest_concurrent_count}, ジョブ名: {highest_concurrent_job_name}")
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
-    # アカウント全体のジョブ数を取得してコンソールに出力
-    all_jobs = get_all_glue_jobs()
-    account_job_count = len(all_jobs)
-    print(f"アカウント内のジョブの総数: {account_job_count}")
-
-    # アカウント全体の同時実行ジョブ数と詳細を取得
-    max_concurrent_jobs, max_concurrent_job_names = get_account_concurrent_jobs()
-    print(f"アカウント全体の同時実行ジョブの最大数: {max_concurrent_jobs}, ジョブ名: {max_concurrent_job_names}")
-
-    # ジョブごとの同時実行ジョブ数をCSVに保存し、最大値を出力
-    save_job_concurrent_counts_to_csv()
-
-
-
-----------12/12-----------
-
-import json
-import boto3
-
-def lambda_handler(event, context):
-    ddl_count = 0
-    dml_count = 0
-    max_ddl_time = 0
-    max_dml_time = 0
-
-    for record in event['Records']:
-        query = record['query']
-        execution_time = record.get('executionTime', 0)
-        
-        # クエリを分類
-        if query.upper().startswith(('CREATE', 'ALTER', 'DROP')):
-            ddl_count += 1
-            max_ddl_time = max(max_ddl_time, execution_time)
-        elif query.upper().startswith(('SELECT', 'INSERT', 'UPDATE', 'DELETE')):
-            dml_count += 1
-            max_dml_time = max(max_dml_time, execution_time)
-
-    # CloudWatchメトリクスに送信
-    cloudwatch = boto3.client('cloudwatch')
-    cloudwatch.put_metric_data(
-        Namespace='AthenaMetrics',
-        MetricData=[
-            {'MetricName': 'ActiveDDLQueries', 'Value': ddl_count},
-            {'MetricName': 'ActiveDMLQueries', 'Value': dml_count},
-            {'MetricName': 'MaxDDLExecutionTime', 'Value': max_ddl_time},
-            {'MetricName': 'MaxDMLExecutionTime', 'Value': max_dml_time},
-        ]
-    )
-    return {'status': 'success'}
-
-
-----------12/12-------- python
-
-import boto3
-
-def get_athena_query_details():
-    client = boto3.client('athena', region_name='your-region')
-    query_ids = client.list_query_executions()['QueryExecutionIds']
-
-    active_ddl = 0
-    active_dml = 0
-    max_ddl_time = 0
-    max_dml_time = 0
-
-    for query_id in query_ids:
-        query_execution = client.get_query_execution(QueryExecutionId=query_id)
-        query = query_execution['QueryExecution']['Query']
-        state = query_execution['QueryExecution']['Status']['State']
-        execution_time = query_execution['QueryExecution']['Statistics'].get('EngineExecutionTimeInMillis', 0)
-
-        # クエリを解析して分類
-        if query.strip().upper().startswith(('CREATE', 'ALTER', 'DROP')):
-            if state == 'RUNNING':
-                active_ddl += 1
-            max_ddl_time = max(max_ddl_time, execution_time)
-        elif query.strip().upper().startswith(('SELECT', 'INSERT', 'UPDATE', 'DELETE')):
-            if state == 'RUNNING':
-                active_dml += 1
-            max_dml_time = max(max_dml_time, execution_time)
-
-    return {
-        "active_ddl": active_ddl,
-        "active_dml": active_dml,
-        "max_ddl_time_ms": max_ddl_time,
-        "max_dml_time_ms": max_dml_time,
-    }
-
-
-if __name__ == "__main__":
-    result = get_athena_query_details()
-    print("アクティブなDDLクエリ数:", result["active_ddl"])
-    print("アクティブなDMLクエリ数:", result["active_dml"])
-    print("DDLクエリの最大実行時間 (ms):", result["max_ddl_time_ms"])
-    print("DMLクエリの最大実行時間 (ms):", result["max_dml_time_ms"])
-
-
-------------------python---------------
-import boto3
 import time
 import json
 
@@ -322,3 +83,59 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+-----------
+
+import boto3
+
+def get_active_queries(athena_client):
+    # クエリリストを取得
+    paginator = athena_client.get_paginator('list_query_executions')
+    query_executions = []
+
+    for page in paginator.paginate():
+        query_executions.extend(page['QueryExecutionIds'])
+    
+    active_ddl = 0
+    active_dml = 0
+    max_ddl_time = 0
+    max_dml_time = 0
+
+    for query_id in query_executions:
+        query_execution = athena_client.get_query_execution(QueryExecutionId=query_id)
+        status = query_execution['QueryExecution']['Status']['State']
+        query = query_execution['QueryExecution']['Query']
+        stats = query_execution['QueryExecution']['Statistics']
+
+        if status == "RUNNING":
+            # DDL or DMLチェック
+            if query.strip().upper().startswith(('CREATE', 'ALTER', 'DROP')):
+                active_ddl += 1
+            else:
+                active_dml += 1
+        
+        # 最大実行時間の計算 (DDL)
+        if query.strip().upper().startswith(('CREATE', 'ALTER', 'DROP')):
+            max_ddl_time = max(max_ddl_time, stats.get('EngineExecutionTimeInMillis', 0))
+
+        # 最大実行時間の計算 (DML)
+        if query.strip().upper().startswith(('SELECT', 'INSERT', 'UPDATE', 'DELETE')):
+            max_dml_time = max(max_dml_time, stats.get('EngineExecutionTimeInMillis', 0))
+
+    return {
+        "active_ddl": active_ddl,
+        "active_dml": active_dml,
+        "max_ddl_time_ms": max_ddl_time,
+        "max_dml_time_ms": max_dml_time,
+    }
+
+# メイン処理
+if __name__ == "__main__":
+    athena_client = boto3.client('athena', region_name='your-region')
+    result = get_active_queries(athena_client)
+
+    print("アクティブなDDLクエリ数:", result["active_ddl"])
+    print("アクティブなDMLクエリ数:", result["active_dml"])
+    print("DDLクエリの最大実行時間 (ms):", result["max_ddl_time_ms"])
+    print("DMLクエリの最大実行時間 (ms):", result["max_dml_time_ms"])
