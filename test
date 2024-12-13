@@ -19,10 +19,17 @@ def get_all_query_ids(client):
     return query_ids
 
 def classify_query(query_text):
+    query_text = query_text.strip().lower()  # クエリを小文字に変換し、先頭の余白を削除
     """クエリのタイプを判定 (DDL/DML)"""
-    if ("CREATE TABLE" in query_text and "AS" not in query_text) or ("ALTER TABLE" in query_text and "ADD PARTITION" in query_text):
+    if query_text.startswith("create table") and "as" not in query_text:
         return "DDL"
-    elif ("SELECT" in query_text) or ("CREATE TABLE" in query_text and "AS" in query_text) or ("INSERT INTO" in query_text):
+    if query_text.startswith("alter table") and "add partition" in query_text:
+        return "DDL"
+    if query_text.startswith("select"):
+        return "DML"
+    if query_text.startswith("create table") and "as" in query_text:
+        return "DML"
+    if query_text.startswith("insert into"):
         return "DML"
     return None
 
