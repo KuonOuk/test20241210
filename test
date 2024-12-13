@@ -1,71 +1,10 @@
-import boto3
+    if len(sys.argv) != 5 or sys.argv[1] != '--start' or sys.argv[3] != '--end':
+        print("Usage: python script_name.py --start \"YYYY/MM/DD HH:MM:SS\" --end \"YYYY/MM/DD HH:MM:SS\"")
+        sys.exit(1)
 
-def initialize_athena_client(region_name="your-region"):
-    """Athenaクライアントを初期化"""
-    return boto3.client('athena', region_name=region_name)
+    start_time = sys.argv[2]
+    end_time = sys.argv[4]
 
-def get_all_query_ids(client):
-    """list_query_executionsを使用してすべてのクエリIDを取得"""
-    query_ids = []
-    next_token = None
-
-    while True:
-        response = client.list_query_executions(NextToken=next_token) if next_token else client.list_query_executions()
-        query_ids.extend(response['QueryExecutionIds'])
-        next_token = response.get('NextToken')
-        if not next_token:
-            break
-
-    return query_ids
-
-def classify_query(query_text):
-    query_text = query_text.strip().lower()  # クエリを小文字に変換し、先頭の余白を削除
-    """クエリのタイプを判定 (DDL/DML)"""
-    if query_text.startswith("create table") and "as" not in query_text:
-        return "DDL"
-    if query_text.startswith("alter table") and "add partition" in query_text:
-        return "DDL"
-    if query_text.startswith("select"):
-        return "DML"
-    if query_text.startswith("create table") and "as" in query_text:
-        return "DML"
-    if query_text.startswith("insert into"):
-        return "DML"
-    return None
-
-def get_athena_query_details(client, query_ids):
-    """クエリの詳細を取得して統計情報を計算"""
-    ddl_count = 0
-    dml_count = 0
-    max_ddl_time = 0
-    max_dml_time = 0
-
-    for query_id in query_ids:
-        query_execution = client.get_query_execution(QueryExecutionId=query_id)
-        query_text = query_execution['QueryExecution']['Query']
-        execution_time = query_execution['QueryExecution']['Statistics'].get('TotalExecutionTimeInMillis', 0)
-
-        query_type = classify_query(query_text)
-        if query_type == "DDL":
-            ddl_count += 1
-            max_ddl_time = max(max_ddl_time, execution_time)
-        elif query_type == "DML":
-            dml_count += 1
-            max_dml_time = max(max_dml_time, execution_time)
-
-    return {
-        "ddl_count": ddl_count,
-        "dml_count": dml_count,
-        "max_ddl_time_seconds": max_ddl_time / 1000,
-        "max_dml_time_seconds": max_dml_time / 1000,
-    }
-
-if __name__ == "__main__":
-    client = initialize_athena_client()
-    query_ids = get_all_query_ids(client)
-    result = get_athena_query_details(client, query_ids)
-
-    print("DDLクエリ数:", result["ddl_count"])
-    print("DMLクエリ数:", result["dml_count"])
-    print("DDLクエリの最大実行時間 (秒):", round(result["max_ddl_time_seconds"], 2))
-    print("DMLクエリの最大実行時間 (秒):", round(result["max_dml_time_seconds"], 2))
+    # 日時のパース
+    start_time = datetime.strptime(start_time, "%Y/%m/%d %H:%M:%S")
+    end_time = datetime.strptime(end_time, "%Y/%m/%d %H:%M:%S")
