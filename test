@@ -1,72 +1,64 @@
 import boto3
-import time
-from botocore.exceptions import ClientError
+
+def initialize_athena_client(region_name="your-region"):
+    """Athenaクライアントを初期化"""
+    return boto3.client('athena', region_name=region_name)
 
 def get_all_query_ids(client):
-    """list_query_executionsを使用して全てのクエリIDを取得"""
+    """list_query_executionsを使用してすべてのクエリIDを取得"""
     query_ids = []
-    paginator = client.get_paginator('list_query_executions')
-    for page in paginator.paginate():
-        query_ids.extend(page['QueryExecutionIds'])
+    next_token = None
+
+    while True:
+        response = client.list_query_executions(NextToken=next_token) if next_token else client.list_query_executions()
+        query_ids.extend(response['QueryExecutionIds'])
+        next_token = response.get('NextToken')
+        if not next_token:
+            break
+
     return query_ids
 
-def get_query_execution_safe(client, query_id):
-    """get_query_executionを安全に呼び出す（スロットリング対策）"""
-    retries = 5  # リトライ回数
-    for attempt in range(retries):
-        try:
-            return client.get_query_execution(QueryExecutionId=query_id)
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'ThrottlingException' and attempt < retries - 1:
-                print(f"スロットリング発生... リトライ中 ({attempt + 1}/{retries})")
-                time.sleep(2 ** attempt)  # エクスポネンシャルバックオフ
-            else:
-                raise
+def classify_query(query_text):
+    """クエリのタイプを判定 (DDL/DML)"""
+    if ("CREATE TABLE" in query_text and "AS" not in query_text) or ("ALTER TABLE" in query_text and "ADD PARTITION" in query_text):
+        return "DDL"
+    elif ("SELECT" in query_text) or ("CREATE TABLE" in query_text and "AS" in query_text) or ("INSERT INTO" in query_text):
+        return "DML"
+    return None
 
-def get_athena_query_details():
-    # Athenaクライアントの初期化
-    client = boto3.client('athena', region_name='your-region')  # 適切なリージョンを指定
+def get_athena_query_details(client, query_ids):
+    """クエリの詳細を取得して統計情報を計算"""
+    ddl_count = 0
+    dml_count = 0
+    max_ddl_time = 0
+    max_dml_time = 0
 
-    # クエリIDを全て取得
-    query_ids = get_all_query_ids(client)
-
-    # クエリ統計を初期化
-    succeeded_ddl = 0
-    succeeded_dml = 0
-    max_ddl_time = 0  # 最大実行時間 (ミリ秒)
-    max_dml_time = 0  # 最大実行時間 (ミリ秒)
-
-    # 各クエリIDを処理
     for query_id in query_ids:
-        query_execution = get_query_execution_safe(client, query_id)
-        state = query_execution['QueryExecution']['Status']['State']  # クエリステータス
-        statement_type = query_execution['QueryExecution']['StatementType']  # クエリタイプ
+        query_execution = client.get_query_execution(QueryExecutionId=query_id)
+        query_text = query_execution['QueryExecution']['Query']
         execution_time = query_execution['QueryExecution']['Statistics'].get('TotalExecutionTimeInMillis', 0)
 
-        # 成功したクエリ（SUCCEEDED）のみ処理
-        if state == "SUCCEEDED":
-            if statement_type == "DDL":
-                succeeded_ddl += 1
-                max_ddl_time = max(max_ddl_time, execution_time)
-            elif statement_type == "DML":
-                succeeded_dml += 1
-                max_dml_time = max(max_dml_time, execution_time)
-
-    # ミリ秒を秒に変換
-    max_ddl_time_seconds = max_ddl_time / 1000
-    max_dml_time_seconds = max_dml_time / 1000
+        query_type = classify_query(query_text)
+        if query_type == "DDL":
+            ddl_count += 1
+            max_ddl_time = max(max_ddl_time, execution_time)
+        elif query_type == "DML":
+            dml_count += 1
+            max_dml_time = max(max_dml_time, execution_time)
 
     return {
-        "succeeded_ddl": succeeded_ddl,
-        "succeeded_dml": succeeded_dml,
-        "max_ddl_time_seconds": max_ddl_time_seconds,
-        "max_dml_time_seconds": max_dml_time_seconds,
+        "ddl_count": ddl_count,
+        "dml_count": dml_count,
+        "max_ddl_time_seconds": max_ddl_time / 1000,
+        "max_dml_time_seconds": max_dml_time / 1000,
     }
 
-
 if __name__ == "__main__":
-    result = get_athena_query_details()
-    print("成功したDDLクエリ数:", result["succeeded_ddl"])
-    print("成功したDMLクエリ数:", result["succeeded_dml"])
+    client = initialize_athena_client()
+    query_ids = get_all_query_ids(client)
+    result = get_athena_query_details(client, query_ids)
+
+    print("DDLクエリ数:", result["ddl_count"])
+    print("DMLクエリ数:", result["dml_count"])
     print("DDLクエリの最大実行時間 (秒):", round(result["max_ddl_time_seconds"], 2))
     print("DMLクエリの最大実行時間 (秒):", round(result["max_dml_time_seconds"], 2))
