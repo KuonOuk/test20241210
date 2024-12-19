@@ -23,7 +23,7 @@ def delete_folders(folder_name, folder_id):
         error_code = err.response["Error"]["Code"]
         if error_code == "PreconditionNotMetException":
             logging.error("フォルダの削除に失敗しました。原因：%s: %s", error_code, err.response["Error"]["Message"])
-            return False  # 削除処理をスキップして次回ループで再試行
+            return False  # 削除不可、次回ループで再試行
         elif error_code == "ResourceNotFoundException":
             logging.error("フォルダの削除に失敗しました。原因：%s: %s", error_code, err.response["Error"]["Message"])
             return None  # 削除済みとして次回ループで対象外にする
@@ -32,6 +32,24 @@ def delete_folders(folder_name, folder_id):
     except Exception as err:
         logging.error("フォルダの削除に失敗しました: %s", err)
     return False
+
+
+def get_folder_dependencies(folder_id):
+    """フォルダの依存関係を取得"""
+    try:
+        response = qs_client.describe_folder(AwsAccountId=ACCOUNT_ID, FolderId=folder_id)
+        folder_details = response.get("Folder", {})
+        folder_path = folder_details.get("FolderPath", [])
+        return folder_path
+    except ClientError as err:
+        error_code = err.response["Error"]["Code"]
+        if error_code == "ResourceNotFoundException":
+            logging.error("フォルダ詳細情報の取得に失敗しました: %s", err.response["Error"]["Message"])
+        else:
+            logging.error("フォルダ詳細情報の取得に失敗しました: %s", err.response["Error"]["Message"])
+    except Exception as err:
+        logging.error("予期しないエラーが発生しました: %s", err)
+    return []
 
 
 def main():
@@ -79,10 +97,12 @@ def main():
                             if delete_result is True:
                                 deleted_any = True  # 削除が成功したことを記録
                                 folder_ids_to_skip.add(folder_id)  # 削除済みフォルダをスキップ対象に追加
+                            elif delete_result is False:
+                                # PreconditionNotMetException の場合、依存関係を取得して次回ループで再試行
+                                dependencies = get_folder_dependencies(folder_id)
+                                logging.info(f"フォルダ {folder_name} (フォルダID: {folder_id}) の依存関係: {dependencies}")
                             elif delete_result is None:
                                 folder_ids_to_skip.add(folder_id)  # 削除済み（ResourceNotFound）フォルダをスキップ対象に追加
-                            else:
-                                logging.info(f"フォルダ {folder_name} (フォルダID: {folder_id}) は削除不可。依存関係があります。")
                         except ClientError as err:
                             logging.error("フォルダ詳細情報の取得に失敗しました: %s", err.response["Error"]["Message"])
                         except Exception as err:
