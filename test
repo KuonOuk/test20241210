@@ -1,90 +1,104 @@
+import os
 import boto3
-import sys
-from datetime import datetime
+import csv
+import logging
+from botocore.exceptions import ClientError
+import re
 
-def initialize_athena_client(region_name="your-region"):
-    """Athenaクライアントを初期化"""
-    return boto3.client('athena', region_name=region_name)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def get_all_query_ids(client):
-    """list_query_executionsを使用してすべてのクエリIDを取得"""
-    query_ids = []
-    next_token = None
+REGION = "ap-northeast-1"
+ACCOUNT_ID = "5555"
 
-    while True:
-        response = client.list_query_executions(NextToken=next_token) if next_token else client.list_query_executions()
-        query_ids.extend(response['QueryExecutionIds'])
-        next_token = response.get('NextToken')
-        if not next_token:
-            break
+qs_client = boto3.client("quicksight", region_name=REGION)
 
-    return query_ids
 
-def classify_query(query_text):
-    """クエリのタイプを判定 (DDL/DML)"""
-    query_text = query_text.strip().lower()
-    if query_text.startswith("create table") and "as" not in query_text:
-        return "DDL"
-    if query_text.startswith("alter table") and "add partition" in query_text:
-        return "DDL"
-    if query_text.startswith("select"):
-        return "DML"
-    if query_text.startswith("create table") and "as" in query_text:
-        return "DML"
-    if query_text.startswith("insert into"):
-        return "DML"
-    return None
-
-def parse_time_arguments():
-    """コマンドライン引数を処理して開始時刻と終了時刻を取得"""
+def delete_folders(folder_name, folder_id):
+    """フォルダを削除"""
     try:
-        start_time = datetime.strptime(sys.argv[1], "%Y/%m/%d %H:%M:%S")
-        end_time = datetime.strptime(sys.argv[2], "%Y/%m/%d %H:%M:%S")
-    except (IndexError, ValueError):
-        print("Usage: python script_name.py \"YYYY/MM/DD HH:MM:SS\" \"YYYY/MM/DD HH:MM:SS\"")
-        sys.exit(1)
-    return start_time, end_time
+        qs_client.delete_folder(AwsAccountId=ACCOUNT_ID, FolderId=folder_id)
+        logging.info("フォルダを削除成功: %s (フォルダID: %s)", folder_name, folder_id)
+    except ClientError as err:
+        logging.error("フォルダの削除に失敗しました。原因: %s: %s", err.response["Error"]["Code"], err.response["Error"]["Message"])
+    except Exception as err:
+        logging.error("フォルダの削除に失敗しました: %s", err)
 
-def get_athena_query_details(client, start_time, end_time):
-    """クエリの詳細を取得して統計情報を計算"""
-    query_ids = get_all_query_ids(client)
 
-    ddl_count = 0
-    dml_count = 0
-    max_ddl_time = 0
-    max_dml_time = 0
+def main():
+    # CSVファイルパス
+    list_folders_csv = "delete_folders_list.csv"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    list_folders_csv_path = os.path.join(script_dir, list_folders_csv)
 
-    for query_id in query_ids:
-        query_execution = client.get_query_execution(QueryExecutionId=query_id)
-        query_text = query_execution['QueryExecution']['Query']
-        execution_time = query_execution['QueryExecution']['Statistics'].get('TotalExecutionTimeInMillis', 0)
-        query_start_time = query_execution['QueryExecution']['Status']['SubmissionDateTime']
+    # キーワード
+    env_keyword = "testing"
+    keyword = rf"k3g-ry-{env_keyword}[-\w\s]*$"
 
-        # 期間内のクエリのみ処理
-        if not (start_time <= query_start_time <= end_time):
-            continue
+    try:
+        while True:  # 削除可能なフォルダがなくなるまでループ
+            deleted_any = False  # フォルダが削除されたかどうかを追跡
 
-        query_type = classify_query(query_text)
-        if query_type == "DDL":
-            ddl_count += 1
-            max_ddl_time = max(max_ddl_time, execution_time)
-        elif query_type == "DML":
-            dml_count += 1
-            max_dml_time = max(max_dml_time, execution_time)
+            # CSV ファイルを読み込む
+            with open(list_folders_csv_path, mode="r") as file:
+                reader = csv.DictReader(file)
+                rows = list(reader)
 
-    return {
-        "ddl_count": ddl_count,
-        "dml_count": dml_count,
-        "max_ddl_time_seconds": max_ddl_time / 1000,
-        "max_dml_time_seconds": max_dml_time / 1000,
-    }
+                if not rows:
+                    logging.info("CSV ファイルにフォルダが存在しません。削除処理を中断します。")
+                    return
+
+                # CSV からすべての FolderId を抽出
+                folder_ids = [row["FolderId"] for row in rows]
+
+                # フォルダを処理
+                for row in rows:
+                    folder_id = row["FolderId"]
+                    folder_name = row["Name"]
+
+                    # キーワードが FolderId または Name に含まれているか確認
+                    if re.search(keyword, folder_id) or re.search(keyword, folder_name):
+                        folder_arn = f"arn:aws:quicksight:{REGION}:{ACCOUNT_ID}:folder/{folder_id}"
+
+                        try:
+                            # フォルダ詳細を取得
+                            response = qs_client.describe_folder(AwsAccountId=ACCOUNT_ID, FolderId=folder_id)
+                            folder_details = response.get("Folder", {})
+                            folder_path = folder_details.get("FolderPath", [])
+
+                            # FolderPath の中に対象フォルダが含まれる場合は削除不可
+                            is_deletable = True
+                            for ancestor_arn in folder_path:
+                                ancestor_id = ancestor_arn.split('/')[-1]
+                                if ancestor_id in folder_ids:
+                                    is_deletable = False
+                                    break
+
+                            # 削除可能な場合のみ削除
+                            if is_deletable:
+                                delete_folders(folder_name, folder_id)
+                                deleted_any = True  # フォルダ削除が実行されたことを記録
+                            else:
+                                logging.info(f"削除スキップ: %s (フォルダID: %s)", folder_name, folder_id)
+
+                        except ClientError as err:
+                            logging.error("フォルダ詳細情報の取得に失敗しました: %s", err.response["Error"]["Message"])
+                        except Exception as err:
+                            logging.error("予期しないエラーが発生しました: %s", err)
+                    else:
+                        logging.info("キーワードに一致しないフォルダ: %s (フォルダID: %s)", folder_name, folder_id)
+
+            # ループ終了条件
+            if not deleted_any:
+                logging.info("依存関係が解消されたフォルダがなくなりました。削除処理を終了します。")
+                break
+
+    except FileNotFoundError as err:
+        logging.error("ファイルが見つかりません: %s", err)
+    except Exception as err:
+        logging.error("フォルダ削除処理中にエラーが発生しました: %s", err)
+
+    logging.info("全ての処理が完了しました。")
+
 
 if __name__ == "__main__":
-    start_time, end_time = parse_time_arguments()
-    client = initialize_athena_client()
-    result = get_athena_query_details(client, start_time, end_time)
-
-    print("DDLクエリ数:", result["ddl_count"])
-    print("DMLクエリ数:", result["dml_count"])
-    print("DDLクエリの最大実行時間 (秒):", round(result["max_ddl_time_seconds"], 2))
-    print("DMLクエリの最大実行時間 (秒):", round(result["max_dml_time_seconds"], 2))
+    main()
