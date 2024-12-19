@@ -18,10 +18,12 @@ def delete_folders(folder_name, folder_id):
     try:
         qs_client.delete_folder(AwsAccountId=ACCOUNT_ID, FolderId=folder_id)
         logging.info("フォルダを削除成功: %s (フォルダID: %s)", folder_name, folder_id)
+        return True
     except ClientError as err:
         logging.error("フォルダの削除に失敗しました。原因: %s: %s", err.response["Error"]["Code"], err.response["Error"]["Message"])
     except Exception as err:
         logging.error("フォルダの削除に失敗しました: %s", err)
+    return False
 
 
 def main():
@@ -60,7 +62,12 @@ def main():
                         folder_arn = f"arn:aws:quicksight:{REGION}:{ACCOUNT_ID}:folder/{folder_id}"
 
                         try:
-                            # フォルダ詳細を取得
+                            # フォルダ削除処理
+                            if delete_folders(folder_name, folder_id):
+                                deleted_any = True  # 削除が成功したことを記録
+                                continue  # 削除成功の場合、依存関係の確認はスキップ
+
+                            # フォルダ詳細を取得して依存関係を確認
                             response = qs_client.describe_folder(AwsAccountId=ACCOUNT_ID, FolderId=folder_id)
                             folder_details = response.get("Folder", {})
                             folder_path = folder_details.get("FolderPath", [])
@@ -70,13 +77,14 @@ def main():
                             for ancestor_arn in folder_path:
                                 ancestor_id = ancestor_arn.split('/')[-1]
                                 if ancestor_id in folder_ids:
+                                    logging.info(f"フォルダ {folder_name} (フォルダID: {folder_id}) は削除不可。依存関係があります。")
                                     is_deletable = False
                                     break
 
-                            # 削除可能な場合のみ削除
                             if is_deletable:
-                                delete_folders(folder_name, folder_id)
-                                deleted_any = True  # フォルダ削除が実行されたことを記録
+                                # 削除可能な場合に削除を再試行
+                                if delete_folders(folder_name, folder_id):
+                                    deleted_any = True
                             else:
                                 logging.info(f"削除スキップ: %s (フォルダID: %s)", folder_name, folder_id)
 
@@ -89,7 +97,7 @@ def main():
 
             # ループ終了条件
             if not deleted_any:
-                logging.info("依存関係が解消されたフォルダがなくなりました。削除処理を終了します。")
+                logging.info("削除可能なフォルダがなくなりました。削除処理を終了します。")
                 break
 
     except FileNotFoundError as err:
