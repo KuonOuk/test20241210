@@ -1,127 +1,35 @@
-import boto3
-import json
-import pandas as pd
-from datetime import datetime
+import os
+import logging
+from openpyxl import Workbook
 
-# AWS Step Functions クライアント
-client = boto3.client('stepfunctions')
+def get_generic_buckets():
+    """アカウント内の汎用バケットを取得"""
+    try:
+        buckets = list_all_buckets()
+        generic_buckets = [bucket['Name'] for bucket in buckets]
 
-def list_all_state_machines():
-    """すべてのState Machinesを取得"""
-    response = client.list_state_machines()
-    return response.get("stateMachines", [])
+        # ディレクトリ構造がないバケットは汎用バケットとして扱う
+        non_directory_buckets = [bucket for bucket in generic_buckets if '/' not in bucket]
 
-def get_create_state_machine_limit(state_machine):
-    """1. CreateStateMachine スロットリングトークンバケットサイズ"""
-    return f"対象: {state_machine['name']} - データなし (動的情報では取得不可)"
+        bucket_count = len(non_directory_buckets)
+        logging.info("汎用バケット数は %s です。", bucket_count)
 
-def get_describe_execution_limit(state_machine):
-    """2. DescribeExecution スロットリングトークンバケットサイズ"""
-    executions = client.list_executions(stateMachineArn=state_machine["stateMachineArn"], statusFilter="SUCCEEDED")
-    return len(executions.get("executions", []))
+        # Excelファイルに汎用バケットを書き込み
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        generic_buckets_excel = os.path.join(script_dir, 'generic_buckets.xlsx')
 
-def get_describe_state_machine_info(state_machine):
-    """3. DescribeStateMachine スロットリングトークンバケットサイズ"""
-    response = client.describe_state_machine(stateMachineArn=state_machine["stateMachineArn"])
-    return {
-        "Name": response["name"],
-        "CreationDate": response["creationDate"],
-        "RoleArn": response["roleArn"]
-    }
+        workbook = Workbook()
+        sheet = workbook.active  # デフォルトのシート名 ("Sheet")
 
-def get_execution_duration_limit():
-    """4. 実行可能な最大実行時間"""
-    return "1 year (365 days) - 動的情報では取得不可"
+        sheet.append(["BucketName"])  # ヘッダー行
 
-def get_task_input_output_data_size(state_machine):
-    """5. タスクまたは実行時のデータサイズ"""
-    input_data = json.dumps({"example": "test data"})
-    size_in_bytes = len(input_data.encode('utf-8'))
-    return f"{size_in_bytes} bytes for sample input"
+        for bucket in non_directory_buckets:
+            sheet.append([bucket])
 
-def get_list_executions(state_machine):
-    """6. ListExecutions スロットリングトークンバケットサイズ"""
-    response = client.list_executions(stateMachineArn=state_machine["stateMachineArn"], statusFilter="SUCCEEDED")
-    return len(response.get("executions", []))
+        workbook.save(generic_buckets_excel)
+        logging.info("汎用バケット一覧を %s に保存しました。", generic_buckets_excel)
 
-def get_request_size_limit():
-    """7. リクエストサイズ"""
-    return "10 MB - 動的情報では取得不可"
-
-def get_send_task_failure_limit():
-    """8. SendTaskFailure スロットリングトークンバケットサイズ"""
-    return "動的取得不可"
-
-def get_send_task_success_limit():
-    """9. SendTaskSuccess スロットリングトークンバケットサイズ"""
-    return "動的取得不可"
-
-def get_start_execution_info(state_machine):
-    """10. StartExecution スロットリングトークンバケットサイズ"""
-    response = client.start_execution(stateMachineArn=state_machine["stateMachineArn"], input=json.dumps({"test": "data"}))
-    return response["executionArn"]
-
-def get_state_transition_limit():
-    """11. StateTransition スロットリングトークンバケットサイズ"""
-    return "25,000 transitions/second - 動的取得不可"
-
-def get_task_execution_duration_limit():
-    """12. タスクの最大実行時間"""
-    return "1 year - 動的情報では取得不可"
-
-def get_untag_resource_limit():
-    """13. UntagResource スロットリングトークンバケットサイズ"""
-    return "動的取得不可"
-
-def get_update_state_machine_info(state_machine):
-    """14. UpdateStateMachine スロットリングトークンバケットサイズ"""
-    state_machine_info = client.describe_state_machine(stateMachineArn=state_machine["stateMachineArn"])
-    response = client.update_state_machine(
-        stateMachineArn=state_machine["stateMachineArn"],
-        definition=json.dumps(state_machine_info["definition"]),
-        roleArn=state_machine_info["roleArn"]
-    )
-    return response["updateDate"]
-
-def process_all_state_machines():
-    """すべてのState Machinesを処理して情報を取得"""
-    state_machines = list_all_state_machines()
-    results = []
-
-    for sm in state_machines:
-        sm_data = {
-            "StateMachineName": sm["name"],
-            "1. CreateStateMachine": get_create_state_machine_limit(sm),
-            "2. DescribeExecution": get_describe_execution_limit(sm),
-            "3. DescribeStateMachine": get_describe_state_machine_info(sm),
-            "4. ExecutionDuration": get_execution_duration_limit(),
-            "5. TaskInputOutputDataSize": get_task_input_output_data_size(sm),
-            "6. ListExecutions": get_list_executions(sm),
-            "7. RequestSizeLimit": get_request_size_limit(),
-            "8. SendTaskFailureLimit": get_send_task_failure_limit(),
-            "9. SendTaskSuccessLimit": get_send_task_success_limit(),
-            "10. StartExecutionInfo": get_start_execution_info(sm),
-            "11. StateTransitionLimit": get_state_transition_limit(),
-            "12. TaskExecutionDurationLimit": get_task_execution_duration_limit(),
-            "13. UntagResourceLimit": get_untag_resource_limit(),
-            "14. UpdateStateMachineInfo": get_update_state_machine_info(sm)
-        }
-        results.append(sm_data)
-
-    return results
-
-def save_to_excel(data, filename="state_machines_info.xlsx"):
-    """データをExcelファイルに保存"""
-    # データをDataFrameに変換
-    df = pd.DataFrame(data)
-
-    # Excelファイルに保存
-    df.to_excel(filename, index=False)
-    print(f"データを保存しました: {filename}")
-
-if __name__ == "__main__":
-    # 全てのState Machinesを対象に情報を取得
-    data = process_all_state_machines()
-
-    # 結果をExcelファイルに保存
-    save_to_excel(data)
+        return non_directory_buckets, bucket_count
+    except Exception as err:
+        logging.error("汎用バケットの取得処理中にエラーが発生しました: %s", err)
+        return []
