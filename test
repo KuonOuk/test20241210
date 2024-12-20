@@ -1,127 +1,127 @@
-import os
 import boto3
-import csv
-import logging
-from botocore.exceptions import ClientError
-import re
+import json
+import pandas as pd
+from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# AWS Step Functions クライアント
+client = boto3.client('stepfunctions')
 
-REGION = "ap-northeast-1"
-ACCOUNT_ID = "5555"
+def list_all_state_machines():
+    """すべてのState Machinesを取得"""
+    response = client.list_state_machines()
+    return response.get("stateMachines", [])
 
-qs_client = boto3.client("quicksight", region_name=REGION)
+def get_create_state_machine_limit(state_machine):
+    """1. CreateStateMachine スロットリングトークンバケットサイズ"""
+    return f"対象: {state_machine['name']} - データなし (動的情報では取得不可)"
 
+def get_describe_execution_limit(state_machine):
+    """2. DescribeExecution スロットリングトークンバケットサイズ"""
+    executions = client.list_executions(stateMachineArn=state_machine["stateMachineArn"], statusFilter="SUCCEEDED")
+    return len(executions.get("executions", []))
 
-def delete_folders(folder_name, folder_id):
-    """フォルダを削除"""
-    try:
-        qs_client.delete_folder(AwsAccountId=ACCOUNT_ID, FolderId=folder_id)
-        logging.info("フォルダを削除成功: %s (フォルダID: %s)", folder_name, folder_id)
-        return True
-    except ClientError as err:
-        error_code = err.response["Error"]["Code"]
-        if error_code == "PreconditionNotMetException":
-            logging.error("フォルダの削除に失敗しました。原因：%s: %s", error_code, err.response["Error"]["Message"])
-            return False  # 削除不可、次回ループで再試行
-        elif error_code == "ResourceNotFoundException":
-            logging.error("フォルダの削除に失敗しました。原因：%s: %s", error_code, err.response["Error"]["Message"])
-            return None  # 削除済みとして次回ループで対象外にする
-        else:
-            logging.error("フォルダの削除に失敗しました。原因：%s: %s", error_code, err.response["Error"]["Message"])
-    except Exception as err:
-        logging.error("フォルダの削除に失敗しました: %s", err)
-    return False
+def get_describe_state_machine_info(state_machine):
+    """3. DescribeStateMachine スロットリングトークンバケットサイズ"""
+    response = client.describe_state_machine(stateMachineArn=state_machine["stateMachineArn"])
+    return {
+        "Name": response["name"],
+        "CreationDate": response["creationDate"],
+        "RoleArn": response["roleArn"]
+    }
 
+def get_execution_duration_limit():
+    """4. 実行可能な最大実行時間"""
+    return "1 year (365 days) - 動的情報では取得不可"
 
-def get_folder_dependencies(folder_id):
-    """フォルダの依存関係を取得"""
-    try:
-        response = qs_client.describe_folder(AwsAccountId=ACCOUNT_ID, FolderId=folder_id)
-        folder_details = response.get("Folder", {})
-        folder_path = folder_details.get("FolderPath", [])
-        return folder_path
-    except ClientError as err:
-        error_code = err.response["Error"]["Code"]
-        if error_code == "ResourceNotFoundException":
-            logging.error("フォルダ詳細情報の取得に失敗しました: %s", err.response["Error"]["Message"])
-        else:
-            logging.error("フォルダ詳細情報の取得に失敗しました: %s", err.response["Error"]["Message"])
-    except Exception as err:
-        logging.error("予期しないエラーが発生しました: %s", err)
-    return []
+def get_task_input_output_data_size(state_machine):
+    """5. タスクまたは実行時のデータサイズ"""
+    input_data = json.dumps({"example": "test data"})
+    size_in_bytes = len(input_data.encode('utf-8'))
+    return f"{size_in_bytes} bytes for sample input"
 
+def get_list_executions(state_machine):
+    """6. ListExecutions スロットリングトークンバケットサイズ"""
+    response = client.list_executions(stateMachineArn=state_machine["stateMachineArn"], statusFilter="SUCCEEDED")
+    return len(response.get("executions", []))
 
-def main():
-    # CSVファイルパス
-    list_folders_csv = "delete_folders_list.csv"
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    list_folders_csv_path = os.path.join(script_dir, list_folders_csv)
+def get_request_size_limit():
+    """7. リクエストサイズ"""
+    return "10 MB - 動的情報では取得不可"
 
-    # キーワード
-    env_keyword = "testing"
-    keyword = rf"k3g-ry-{env_keyword}[-\w\s]*$"
+def get_send_task_failure_limit():
+    """8. SendTaskFailure スロットリングトークンバケットサイズ"""
+    return "動的取得不可"
 
-    try:
-        folder_ids_to_skip = set()  # 削除済みまたは対象外フォルダを追跡
+def get_send_task_success_limit():
+    """9. SendTaskSuccess スロットリングトークンバケットサイズ"""
+    return "動的取得不可"
 
-        while True:  # 削除可能なフォルダがなくなるまでループ
-            deleted_any = False  # フォルダが削除されたかどうかを追跡
+def get_start_execution_info(state_machine):
+    """10. StartExecution スロットリングトークンバケットサイズ"""
+    response = client.start_execution(stateMachineArn=state_machine["stateMachineArn"], input=json.dumps({"test": "data"}))
+    return response["executionArn"]
 
-            # CSV ファイルを読み込む
-            with open(list_folders_csv_path, mode="r") as file:
-                reader = csv.DictReader(file)
-                rows = list(reader)
+def get_state_transition_limit():
+    """11. StateTransition スロットリングトークンバケットサイズ"""
+    return "25,000 transitions/second - 動的取得不可"
 
-                if not rows:
-                    logging.info("CSV ファイルにフォルダが存在しません。削除処理を中断します。")
-                    return
+def get_task_execution_duration_limit():
+    """12. タスクの最大実行時間"""
+    return "1 year - 動的情報では取得不可"
 
-                # CSV からすべての FolderId を抽出
-                folder_ids = [row["FolderId"] for row in rows if row["FolderId"] not in folder_ids_to_skip]
+def get_untag_resource_limit():
+    """13. UntagResource スロットリングトークンバケットサイズ"""
+    return "動的取得不可"
 
-                # フォルダを処理
-                for row in rows:
-                    folder_id = row["FolderId"]
-                    folder_name = row["Name"]
+def get_update_state_machine_info(state_machine):
+    """14. UpdateStateMachine スロットリングトークンバケットサイズ"""
+    state_machine_info = client.describe_state_machine(stateMachineArn=state_machine["stateMachineArn"])
+    response = client.update_state_machine(
+        stateMachineArn=state_machine["stateMachineArn"],
+        definition=json.dumps(state_machine_info["definition"]),
+        roleArn=state_machine_info["roleArn"]
+    )
+    return response["updateDate"]
 
-                    # フォルダが既にスキップ対象の場合は処理しない
-                    if folder_id in folder_ids_to_skip:
-                        continue
+def process_all_state_machines():
+    """すべてのState Machinesを処理して情報を取得"""
+    state_machines = list_all_state_machines()
+    results = []
 
-                    # キーワードが FolderId または Name に含まれているか確認
-                    if re.search(keyword, folder_id) or re.search(keyword, folder_name):
-                        try:
-                            # フォルダ削除処理
-                            delete_result = delete_folders(folder_name, folder_id)
-                            if delete_result is True:
-                                deleted_any = True  # 削除が成功したことを記録
-                                folder_ids_to_skip.add(folder_id)  # 削除済みフォルダをスキップ対象に追加
-                            elif delete_result is False:
-                                # PreconditionNotMetException の場合、依存関係を取得して次回ループで再試行
-                                dependencies = get_folder_dependencies(folder_id)
-                                logging.info(f"フォルダ {folder_name} (フォルダID: {folder_id}) の依存関係: {dependencies}")
-                            elif delete_result is None:
-                                folder_ids_to_skip.add(folder_id)  # 削除済み（ResourceNotFound）フォルダをスキップ対象に追加
-                        except ClientError as err:
-                            logging.error("フォルダ詳細情報の取得に失敗しました: %s", err.response["Error"]["Message"])
-                        except Exception as err:
-                            logging.error("予期しないエラーが発生しました: %s", err)
-                    else:
-                        logging.info("キーワードに一致しないフォルダ: %s (フォルダID: %s)", folder_name, folder_id)
+    for sm in state_machines:
+        sm_data = {
+            "StateMachineName": sm["name"],
+            "1. CreateStateMachine": get_create_state_machine_limit(sm),
+            "2. DescribeExecution": get_describe_execution_limit(sm),
+            "3. DescribeStateMachine": get_describe_state_machine_info(sm),
+            "4. ExecutionDuration": get_execution_duration_limit(),
+            "5. TaskInputOutputDataSize": get_task_input_output_data_size(sm),
+            "6. ListExecutions": get_list_executions(sm),
+            "7. RequestSizeLimit": get_request_size_limit(),
+            "8. SendTaskFailureLimit": get_send_task_failure_limit(),
+            "9. SendTaskSuccessLimit": get_send_task_success_limit(),
+            "10. StartExecutionInfo": get_start_execution_info(sm),
+            "11. StateTransitionLimit": get_state_transition_limit(),
+            "12. TaskExecutionDurationLimit": get_task_execution_duration_limit(),
+            "13. UntagResourceLimit": get_untag_resource_limit(),
+            "14. UpdateStateMachineInfo": get_update_state_machine_info(sm)
+        }
+        results.append(sm_data)
 
-            # ループ終了条件
-            if not deleted_any:
-                logging.info("削除可能なフォルダがなくなりました。削除処理を終了します。")
-                break
+    return results
 
-    except FileNotFoundError as err:
-        logging.error("ファイルが見つかりません: %s", err)
-    except Exception as err:
-        logging.error("フォルダ削除処理中にエラーが発生しました: %s", err)
+def save_to_excel(data, filename="state_machines_info.xlsx"):
+    """データをExcelファイルに保存"""
+    # データをDataFrameに変換
+    df = pd.DataFrame(data)
 
-    logging.info("全ての処理が完了しました。")
-
+    # Excelファイルに保存
+    df.to_excel(filename, index=False)
+    print(f"データを保存しました: {filename}")
 
 if __name__ == "__main__":
-    main()
+    # 全てのState Machinesを対象に情報を取得
+    data = process_all_state_machines()
+
+    # 結果をExcelファイルに保存
+    save_to_excel(data)
